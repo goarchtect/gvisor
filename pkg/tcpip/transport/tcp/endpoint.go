@@ -3061,6 +3061,7 @@ func (e *endpoint) completeState() stack.TCPEndpointState {
 		FACK:        rc.fack,
 		RTT:         rc.rtt,
 		Reord:       rc.reorderSeen,
+		DSACKSeen:   rc.dsackSeen,
 	}
 	return s
 }
