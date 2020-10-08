@@ -67,6 +67,39 @@ func TestIPv6FragmentReassembly(t *testing.T) {
 			},
 			expectReply: true,
 		},
+		{
+			description:  "duplicated fragments",
+			ipPayloadLen: 3000,
+			fragments: []fragmentInfo{
+				{offset: 0, size: 1000, more: true},
+				{offset: 1000, size: 1000, more: true},
+				{offset: 1000, size: 1000, more: true},
+				{offset: 2000, size: 1000, more: false},
+			},
+			expectReply: true,
+		},
+		{
+			description:  "fragment subset",
+			ipPayloadLen: 3000,
+			fragments: []fragmentInfo{
+				{offset: 0, size: 1000, more: true},
+				{offset: 1000, size: 1000, more: true},
+				{offset: 512, size: 256, more: true},
+				{offset: 2000, size: 1000, more: false},
+			},
+			expectReply: true,
+		},
+		{
+			description:  "fragment overlap",
+			ipPayloadLen: 3000,
+			fragments: []fragmentInfo{
+				{offset: 0, size: 1000, more: true},
+				{offset: 1512, size: 1000, more: true},
+				{offset: 1000, size: 1000, more: true},
+				{offset: 2000, size: 1000, more: false},
+			},
+			expectReply: false,
+		},
 	}
 
 	for _, test := range tests {
@@ -120,7 +153,7 @@ func TestIPv6FragmentReassembly(t *testing.T) {
 				}, time.Second)
 				if err != nil {
 					// Either an unexpected frame was received, or none at all.
-					if bytesReceived < test.ipPayloadLen {
+					if test.expectReply && bytesReceived < test.ipPayloadLen {
 						t.Fatalf("received %d bytes out of %d, then conn.ExpectFrame(_, _, time.Second) failed with %s", bytesReceived, test.ipPayloadLen, err)
 					}
 					break
