@@ -47,6 +47,9 @@ type fakeTransportEndpoint struct {
 
 	// acceptQueue is non-nil iff bound.
 	acceptQueue []fakeTransportEndpoint
+
+	// ops is used to set and get socket options.
+	ops tcpip.SocketOptions
 }
 
 func (f *fakeTransportEndpoint) Info() tcpip.EndpointInfo {
@@ -59,6 +62,9 @@ func (*fakeTransportEndpoint) Stats() tcpip.EndpointStats {
 
 func (*fakeTransportEndpoint) SetOwner(owner tcpip.PacketOwner) {}
 
+func (f *fakeTransportEndpoint) SocketOptions() *tcpip.SocketOptions {
+	return &f.ops
+}
 func newFakeTransportEndpoint(proto *fakeTransportProtocol, netProto tcpip.NetworkProtocolNumber, uniqueID uint64) tcpip.Endpoint {
 	return &fakeTransportEndpoint{TransportEndpointInfo: stack.TransportEndpointInfo{NetProto: netProto}, proto: proto, uniqueID: uniqueID}
 }
@@ -184,9 +190,9 @@ func (f *fakeTransportEndpoint) Accept(*tcpip.FullAddress) (tcpip.Endpoint, *wai
 	if len(f.acceptQueue) == 0 {
 		return nil, nil, nil
 	}
-	a := f.acceptQueue[0]
+	a := &f.acceptQueue[0]
 	f.acceptQueue = f.acceptQueue[1:]
-	return &a, nil, nil
+	return a, nil, nil
 }
 
 func (f *fakeTransportEndpoint) Bind(a tcpip.FullAddress) *tcpip.Error {
