@@ -81,6 +81,7 @@ type Fragmentation struct {
 	blockSize    uint16
 	clock        tcpip.Clock
 	releaseJob   *tcpip.Job
+	onTimeout    func(*stack.PacketBuffer)
 }
 
 // NewFragmentation creates a new Fragmentation.
@@ -97,7 +98,11 @@ type Fragmentation struct {
 // reassemblingTimeout specifies the maximum time allowed to reassemble a packet.
 // Fragments are lazily evicted only when a new a packet with an
 // already existing fragmentation-id arrives after the timeout.
-func NewFragmentation(blockSize uint16, highMemoryLimit, lowMemoryLimit int, reassemblingTimeout time.Duration, clock tcpip.Clock) *Fragmentation {
+//
+// onTimeout specifies the function to be called if a packet reassembling has
+// timed out. The first fragment of the packet is passed as the argument (if it
+// has been received).
+func NewFragmentation(blockSize uint16, highMemoryLimit, lowMemoryLimit int, reassemblingTimeout time.Duration, clock tcpip.Clock, onTimeout func(*stack.PacketBuffer)) *Fragmentation {
 	if lowMemoryLimit >= highMemoryLimit {
 		lowMemoryLimit = highMemoryLimit
 	}
@@ -117,6 +122,7 @@ func NewFragmentation(blockSize uint16, highMemoryLimit, lowMemoryLimit int, rea
 		timeout:      reassemblingTimeout,
 		blockSize:    blockSize,
 		clock:        clock,
+		onTimeout:    onTimeout,
 	}
 	f.releaseJob = tcpip.NewJob(f.clock, &f.mu, f.releaseReassemblersLocked)
 
@@ -136,16 +142,8 @@ func NewFragmentation(blockSize uint16, highMemoryLimit, lowMemoryLimit int, rea
 // proto is the protocol number marked in the fragment being processed. It has
 // to be given here outside of the FragmentID struct because IPv6 should not use
 // the protocol to identify a fragment.
-//
-// releaseCB is a callback that will run when the fragment reassembly of a
-// packet is complete or cancelled. releaseCB take a a boolean argument which is
-// true iff the reassembly is cancelled due to timeout. releaseCB should be
-// passed only with the first fragment of a packet. If more than one releaseCB
-// are passed for the same packet, only the first releaseCB will be saved for
-// the packet and the succeeding ones will be dropped by running them
-// immediately with a false argument.
 func (f *Fragmentation) Process(
-	id FragmentID, first, last uint16, more bool, proto uint8, vv buffer.VectorisedView, releaseCB func(bool)) (
+	id FragmentID, first, last uint16, more bool, proto uint8, pkt *stack.PacketBuffer) (
 	buffer.VectorisedView, uint8, bool, error) {
 	if first > last {
 		return buffer.VectorisedView{}, 0, false, fmt.Errorf("first=%d is greater than last=%d: %w", first, last, ErrInvalidArgs)
@@ -160,10 +158,9 @@ func (f *Fragmentation) Process(
 		return buffer.VectorisedView{}, 0, false, fmt.Errorf("fragment size=%d bytes is not a multiple of block size=%d on non-final fragment: %w", fragmentSize, f.blockSize, ErrInvalidArgs)
 	}
 
-	if l := vv.Size(); l < int(fragmentSize) {
-		return buffer.VectorisedView{}, 0, false, fmt.Errorf("got fragment size=%d bytes less than the expected fragment size=%d bytes (first=%d last=%d): %w", l, fragmentSize, first, last, ErrInvalidArgs)
+	if l := pkt.Data.Size(); l != int(fragmentSize) {
+		return buffer.VectorisedView{}, 0, false, fmt.Errorf("got fragment size=%d bytes not equal to the expected fragment size=%d bytes (first=%d last=%d): %w", l, fragmentSize, first, last, ErrInvalidArgs)
 	}
-	vv.CapLength(int(fragmentSize))
 
 	f.mu.Lock()
 	r, ok := f.reassemblers[id]
@@ -179,15 +176,9 @@ func (f *Fragmentation) Process(
 			f.releaseReassemblersLocked()
 		}
 	}
-	if releaseCB != nil {
-		if !r.setCallback(releaseCB) {
-			// We got a duplicate callback. Release it immediately.
-			releaseCB(false /* timedOut */)
-		}
-	}
 	f.mu.Unlock()
 
-	res, firstFragmentProto, done, consumed, err := r.process(first, last, more, proto, vv)
+	res, firstFragmentProto, done, consumed, err := r.process(first, last, more, proto, pkt)
 	if err != nil {
 		// We probably got an invalid sequence of fragments. Just
 		// discard the reassembler and move on.
@@ -231,7 +222,9 @@ func (f *Fragmentation) release(r *reassembler, timedOut bool) {
 		f.size = 0
 	}
 
-	r.release(timedOut) // releaseCB may run.
+	if timedOut && f.onTimeout != nil {
+		f.onTimeout(r.pkt)
+	}
 }
 
 // releaseReassemblersLocked releases already-expired reassemblers, then
