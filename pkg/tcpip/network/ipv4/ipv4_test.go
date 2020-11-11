@@ -599,7 +599,7 @@ func TestIPv4Sanity(t *testing.T) {
 				},
 			})
 
-			ipHeaderLength := header.IPv4MinimumSize + test.options.AllocationSize()
+			ipHeaderLength := header.IPv4MinimumSize + test.options.SizeWithPadding()
 			if ipHeaderLength > header.IPv4MaximumHeaderSize {
 				t.Fatalf("too many bytes in options: got = %d, want <= %d ", ipHeaderLength, header.IPv4MaximumHeaderSize)
 			}
