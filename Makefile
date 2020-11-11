@@ -288,30 +288,18 @@ BENCHMARKS_ARGS      := -test.bench=.
 
 init-benchmark-table: ## Initializes a BigQuery table with the benchmark schema
 ## (see //tools/bigquery/bigquery.go). If the table alread exists, this is a noop.
-	$(call submake, run TARGETS=//tools/parsers:parser ARGS="init --project=$(BENCHMARKS_PROJECT) \
+	$(call submake,run TARGETS=//tools/parsers:parser ARGS="init --project=$(BENCHMARKS_PROJECT) \
 	--dataset=$(BENCHMARKS_DATASET) --table=$(BENCHMARKS_TABLE)")
 .PHONY: init-benchmark-table
 
 benchmark-platforms: load-benchmarks-images ## Runs benchmarks for runc and all given platforms in BENCHMARK_PLATFORMS.
-	$(call submake, run-benchmark RUNTIME="runc")
-	$(foreach PLATFORM,$(BENCHMARKS_PLATFORMS), \
-		$(call submake,install-runtime RUNTIME="$(PLATFORM)" ARGS="--platform=$(PLATFORM) --vfs2") && \
-		$(call submake,run-benchmark RUNTIME="$(PLATFORM)") && \
-		$(call submake,install-runtime RUNTIME="$(PLATFORM)_vfs1" ARGS="--platform=$(PLATFORM)") && \
-		$(call submake,run-benchmark RUNTIME="$(PLATFORM)_vfs1") && \
-	) \
-	true
+	@$(call submake,test TARGETS=test/benchmarks/base:startup_test OPTIONS="--test_arg='--runtime=runc --test.v --test.bench=.'")
+	$(call submake,run TARGETS=//tools/parsers:parser)
 .PHONY: benchmark-platforms
 
 run-benchmark: ## Runs single benchmark and optionally sends data to BigQuery.
-	@set -xeuo pipefail; 	T=$$(mktemp --tmpdir logs.$(RUNTIME).XXXXXX); \
-	$(call submake,sudo TARGETS="$(BENCHMARKS_TARGETS)" ARGS="--runtime=$(RUNTIME) $(BENCHMARKS_ARGS)" | tee $$T); \
-	if [[ "$(BENCHMARKS_UPLOAD)" == "true" ]]; then \
-		$(call submake,run TARGETS=tools/parsers:parser ARGS="parse --debug --file=$$T \
-			--runtime=$(RUNTIME) --suite_name=$(BENCHMARKS_SUITE) \
-			--project=$(BENCHMARKS_PROJECT) --dataset=$(BENCHMARKS_DATASET) \
-			--table=$(BENCHMARKS_TABLE) --official=$(BENCHMARKS_OFFICIAL)"); \
-	fi; \
+	$(call submake,test TARGETS="$(BENCHMARKS_TARGETS)" ARGS="--runtime=$(RUNTIME) --v --bench=. --benchtime=1x")
+	$(call submake,run TARGETS=//tools/parsers:parser)
 	rm -rf $$T
 .PHONY: run-benchmark
 

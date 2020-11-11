@@ -513,6 +513,7 @@ func (c *Container) Remove(ctx context.Context) error {
 
 // CleanUp kills and deletes the container (best effort).
 func (c *Container) CleanUp(ctx context.Context) {
+	c.logger.Logf("Starting profiles")
 	// Execute profile cleanups before the container goes down.
 	for _, profile := range c.profiles {
 		profile.OnCleanUp(c)
@@ -521,6 +522,7 @@ func (c *Container) CleanUp(ctx context.Context) {
 	// Forget profiles.
 	c.profiles = nil
 
+	c.logger.Logf("Starting cleanups")
 	// Execute all cleanups. We execute cleanups here to close any
 	// open connections to the container before closing. Open connections
 	// can cause Kill and Remove to hang.
@@ -529,11 +531,17 @@ func (c *Container) CleanUp(ctx context.Context) {
 	}
 	c.cleanups = nil
 
+	c.logger.Logf("Killing container")
 	// Kill the container.
-	if err := c.Kill(ctx); err != nil && !strings.Contains(err.Error(), "is not running") {
-		// Just log; can't do anything here.
-		c.logger.Logf("error killing container %q: %v", c.Name, err)
-	}
+	go func() {
+		if err := c.Kill(ctx); err != nil && !strings.Contains(err.Error(), "is not running") {
+			// Just log; can't do anything here.
+			c.logger.Logf("error killing container %q: %v", c.Name, err)
+		}
+	}()
+	time.Sleep(time.Second * 2)
+
+	c.logger.Logf("Removing image")
 	// Remove the image.
 	if err := c.Remove(ctx); err != nil {
 		c.logger.Logf("error removing container %q: %v", c.Name, err)
