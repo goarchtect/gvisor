@@ -657,7 +657,7 @@ exitLoop:
 	// If the write ends beyond the file's previous size, it causes the
 	// file to grow.
 	if rw.off > rw.file.size {
-		rw.file.size = rw.off
+		atomic.StoreUint64(&rw.file.size, rw.off)
 	}
 
 	return done, retErr
