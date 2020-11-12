@@ -28,6 +28,7 @@ package raw
 import (
 	"fmt"
 
+	"gvisor.dev/gvisor/pkg/sleep"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
@@ -89,6 +90,10 @@ type endpoint struct {
 
 	// owner is used to get uid and gid of the packet.
 	owner tcpip.PacketOwner
+
+	// resCh is used to allow callers to wait on address resolution. It is nil
+	// iff address resolution is not yet in progress.
+	resCh chan struct{} `state:"nosave"`
 }
 
 // NewEndpoint returns a raw  endpoint for the given protocols.
@@ -345,9 +350,32 @@ func (e *endpoint) finishWrite(payloadBytes []byte, route *stack.Route) (int64, 
 	// network address). If that requires blocking (e.g. to use ARP),
 	// return a channel on which the caller can wait.
 	if route.IsResolutionRequired() {
-		if ch, err := route.Resolve(nil); err != nil {
+		waker := &sleep.Waker{}
+		if err := route.Resolve(nil, waker); err != nil {
 			if err == tcpip.ErrWouldBlock {
-				return 0, ch, tcpip.ErrNoLinkAddress
+				e.mu.RUnlock()
+				defer e.mu.RLock()
+
+				e.mu.Lock()
+				defer e.mu.Unlock()
+
+				if e.resCh == nil {
+					e.resCh = make(chan struct{})
+					go func() {
+						s := sleep.Sleeper{}
+						defer s.Done()
+
+						s.AddWaker(waker, 0)
+						_, _ = s.Fetch(true /* block */)
+
+						e.mu.Lock()
+						defer e.mu.Unlock()
+
+						close(e.resCh)
+						e.resCh = nil
+					}()
+				}
+				return 0, e.resCh, tcpip.ErrNoLinkAddress
 			}
 			return 0, nil, err
 		}

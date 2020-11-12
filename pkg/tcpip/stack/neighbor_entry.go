@@ -67,8 +67,10 @@ const (
 	// Static describes entries that have been explicitly added by the user. They
 	// do not expire and are not deleted until explicitly removed.
 	Static
-	// Failed means traffic should not be sent to this neighbor since attempts of
-	// reachability have returned inconclusive.
+	// Failed is deprecated, do not use.
+	//
+	// TODO(fxbug.dev/63745): Remove this constant once Fuchsia removes relevant
+	// references. This process avoids a breaking changes and races.
 	Failed
 )
 
@@ -98,10 +100,9 @@ type neighborEntry struct {
 	// address resolution is ongoing and no clients are waiting for the result.
 	wakers map[*sleep.Waker]struct{}
 
-	// done is used to allow callers to wait on address resolution. It is nil
-	// iff nudState is not Reachable and address resolution is not yet in
-	// progress.
-	done chan struct{}
+	// done is used to allow callers to wait for the result of address
+	// resolution.
+	done []chan<- tcpip.LinkAddress
 
 	isRouter bool
 	job      *tcpip.Job
@@ -155,17 +156,23 @@ func (e *neighborEntry) addWakerLocked(w *sleep.Waker) {
 	e.wakers[w] = struct{}{}
 }
 
-// notifyWakersLocked notifies those waiting for address resolution, whether it
+// notifyLocked notifies those waiting for address resolution, whether it
 // succeeded or failed. Assumes the entry has already been appropriately locked.
-func (e *neighborEntry) notifyWakersLocked() {
+func (e *neighborEntry) notifyLocked(linkAddr tcpip.LinkAddress) {
 	for w := range e.wakers {
 		w.Assert()
 	}
 	e.wakers = nil
-	if ch := e.done; ch != nil {
+	for _, ch := range e.done {
+		if len(linkAddr) != 0 {
+			select {
+			case ch <- linkAddr:
+			default:
+			}
+		}
 		close(ch)
-		e.done = nil
 	}
+	e.done = nil
 }
 
 // dispatchAddEventLocked signals to stack's NUD Dispatcher that the entry has
@@ -192,17 +199,31 @@ func (e *neighborEntry) dispatchRemoveEventLocked() {
 	}
 }
 
+// cancelJobLocked cancels the currently scheduled action, if there is one.
+// Entries in Unknown, Stale, or Static state do not have a scheduled action.
+func (e *neighborEntry) cancelJobLocked() {
+	if job := e.job; job != nil {
+		job.Cancel()
+	}
+}
+
+// removeLocked prepares the entry for removal.
+func (e *neighborEntry) removeLocked() {
+	e.neigh.UpdatedAtNanos = e.nic.stack.clock.NowNanoseconds()
+	e.dispatchRemoveEventLocked()
+	e.cancelJobLocked()
+
+	// Notify callers of address resolution failure, if it's in progress.
+	e.notifyLocked("" /* linkAddr */)
+}
+
 // setStateLocked transitions the entry to the specified state immediately.
 //
 // Follows the logic defined in RFC 4861 section 7.3.3.
 //
 // e.mu MUST be locked.
 func (e *neighborEntry) setStateLocked(next NeighborState) {
-	// Cancel the previously scheduled action, if there is one. Entries in
-	// Unknown, Stale, or Static state do not have scheduled actions.
-	if timer := e.job; timer != nil {
-		timer.Cancel()
-	}
+	e.cancelJobLocked()
 
 	prev := e.neigh.State
 	e.neigh.State = next
@@ -233,14 +254,12 @@ func (e *neighborEntry) setStateLocked(next NeighborState) {
 
 		sendUnicastProbe = func() {
 			if retryCounter == config.MaxUnicastProbes {
-				e.dispatchRemoveEventLocked()
-				e.setStateLocked(Failed)
+				e.nic.neigh.removeEntryLocked(e)
 				return
 			}
 
 			if err := e.linkRes.LinkAddressRequest(e.neigh.Addr, "" /* localAddr */, e.neigh.LinkAddr, e.nic); err != nil {
-				e.dispatchRemoveEventLocked()
-				e.setStateLocked(Failed)
+				e.nic.neigh.removeEntryLocked(e)
 				return
 			}
 
@@ -255,13 +274,6 @@ func (e *neighborEntry) setStateLocked(next NeighborState) {
 		// such as loopback and integration tests.
 		e.job = e.nic.stack.newJob(&e.mu, sendUnicastProbe)
 		e.job.Schedule(immediateDuration)
-
-	case Failed:
-		e.notifyWakersLocked()
-		e.job = e.nic.stack.newJob(&e.mu, func() {
-			e.nic.neigh.removeEntryLocked(e)
-		})
-		e.job.Schedule(config.UnreachableTime)
 
 	case Unknown, Stale, Static:
 		// Do nothing
@@ -309,9 +321,8 @@ func (e *neighborEntry) handlePacketQueuedLocked(localAddr tcpip.Address) {
 				// implementation may find it convenient in some cases to return errors
 				// to the sender by taking the offending packet, generating an ICMP
 				// error message, and then delivering it (locally) through the generic
-				// error-handling routines.' - RFC 4861 section 2.1
-				e.dispatchRemoveEventLocked()
-				e.setStateLocked(Failed)
+				// error-handling routines." - RFC 4861 section 2.1
+				e.nic.neigh.removeEntryLocked(e)
 				return
 			}
 
@@ -326,8 +337,7 @@ func (e *neighborEntry) handlePacketQueuedLocked(localAddr tcpip.Address) {
 				// There is no need to log the error here; the NUD implementation may
 				// assume a working link. A valid link should be the responsibility of
 				// the NIC/stack.LinkEndpoint.
-				e.dispatchRemoveEventLocked()
-				e.setStateLocked(Failed)
+				e.nic.neigh.removeEntryLocked(e)
 				return
 			}
 
@@ -347,7 +357,7 @@ func (e *neighborEntry) handlePacketQueuedLocked(localAddr tcpip.Address) {
 		e.setStateLocked(Delay)
 		e.dispatchChangeEventLocked()
 
-	case Incomplete, Reachable, Delay, Probe, Static, Failed:
+	case Incomplete, Reachable, Delay, Probe, Static:
 		// Do nothing
 
 	default:
@@ -365,11 +375,21 @@ func (e *neighborEntry) handleProbeLocked(remoteLinkAddr tcpip.LinkAddress) {
 	// checks MUST be done by the NetworkEndpoint.
 
 	switch e.neigh.State {
-	case Unknown, Incomplete, Failed:
+	case Unknown:
 		e.neigh.LinkAddr = remoteLinkAddr
 		e.setStateLocked(Stale)
-		e.notifyWakersLocked()
 		e.dispatchAddEventLocked()
+
+	case Incomplete:
+		// "If an entry already exists, and the cached link-layer address
+		// differs from the one in the received Source Link-Layer option, the
+		// cached address should be replaced by the received address, and the
+		// entry's reachability state MUST be set to STALE."
+		//  - RFC 4861 section 7.2.3
+		e.neigh.LinkAddr = remoteLinkAddr
+		e.setStateLocked(Stale)
+		e.notifyLocked(remoteLinkAddr)
+		e.dispatchChangeEventLocked()
 
 	case Reachable, Delay, Probe:
 		if e.neigh.LinkAddr != remoteLinkAddr {
@@ -421,7 +441,7 @@ func (e *neighborEntry) handleConfirmationLocked(linkAddr tcpip.LinkAddress, fla
 		}
 		e.dispatchChangeEventLocked()
 		e.isRouter = flags.IsRouter
-		e.notifyWakersLocked()
+		e.notifyLocked(linkAddr)
 
 		// "Note that the Override flag is ignored if the entry is in the
 		// INCOMPLETE state." - RFC 4861 section 7.2.5
@@ -456,7 +476,7 @@ func (e *neighborEntry) handleConfirmationLocked(linkAddr tcpip.LinkAddress, fla
 			wasReachable := e.neigh.State == Reachable
 			// Set state to Reachable again to refresh timers.
 			e.setStateLocked(Reachable)
-			e.notifyWakersLocked()
+			e.notifyLocked(linkAddr)
 			if !wasReachable {
 				e.dispatchChangeEventLocked()
 			}
@@ -484,7 +504,7 @@ func (e *neighborEntry) handleConfirmationLocked(linkAddr tcpip.LinkAddress, fla
 		}
 		e.isRouter = flags.IsRouter
 
-	case Unknown, Failed, Static:
+	case Unknown, Static:
 		// Do nothing
 
 	default:
@@ -504,7 +524,7 @@ func (e *neighborEntry) handleUpperLevelConfirmationLocked() {
 			e.dispatchChangeEventLocked()
 		}
 
-	case Unknown, Incomplete, Failed, Static:
+	case Unknown, Incomplete, Static:
 		// Do nothing
 
 	default:
