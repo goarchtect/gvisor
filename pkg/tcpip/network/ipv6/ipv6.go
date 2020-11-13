@@ -645,6 +645,18 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 // forwardPacket attempts to forward a packet to its final destination.
 func (e *endpoint) forwardPacket(pkt *stack.PacketBuffer) *tcpip.Error {
 	h := header.IPv6(pkt.NetworkHeader().View())
+	hopLimit := h.HopLimit()
+	if hopLimit <= 1 {
+		// As per RFC 4443 section 3.3,
+		//
+		//   If a router receives a packet with a Hop Limit of zero, or if a
+		//   router decrements a packet's Hop Limit to zero, it MUST discard the
+		//   packet and originate an ICMPv6 Time Exceeded message with Code 0 to
+		//   the source of the packet.  This indicates either a routing loop or
+		//   too small an initial Hop Limit value.
+		return e.protocol.returnError(&icmpReasonHopLimitExceeded{}, pkt, false /* specifyLocalAddr */)
+	}
+
 	dstAddr := h.DestinationAddress()
 
 	// Check if the destination is owned by the stack.
@@ -663,13 +675,20 @@ func (e *endpoint) forwardPacket(pkt *stack.PacketBuffer) *tcpip.Error {
 	}
 	defer r.Release()
 
-	// TODO(b/143425874) Decrease the TTL field in forwarded packets.
+	// We need to do a deep copy of the IP packet because
+	// WriteHeaderIncludedPacket takes ownership of the packet buffer, but we do
+	// not own it.
+	newHdr := header.IPv6(stack.PayloadSince(pkt.NetworkHeader()))
+
+	// As per RFC 8200 section 3,
+	//
+	//   Hop Limit           8-bit unsigned integer. Decremented by 1 by
+	//                       each node that forwards the packet.
+	newHdr.SetHopLimit(hopLimit - 1)
+
 	return r.WriteHeaderIncludedPacket(stack.NewPacketBuffer(stack.PacketBufferOptions{
 		ReserveHeaderBytes: int(r.MaxHeaderLength()),
-		// We need to do a deep copy of the IP packet because
-		// WriteHeaderIncludedPacket takes ownership of the packet buffer, but we do
-		// not own it.
-		Data: stack.PayloadSince(pkt.NetworkHeader()).ToVectorisedView(),
+		Data:               buffer.View(newHdr).ToVectorisedView(),
 	}))
 }
 
@@ -769,7 +788,7 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 				_ = e.protocol.returnError(&icmpReasonParameterProblem{
 					code:    header.ICMPv6UnknownHeader,
 					pointer: previousHeaderStart,
-				}, pkt)
+				}, pkt, true /* specifyLocalAddr */)
 				return
 			}
 
@@ -809,7 +828,7 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 						code:               header.ICMPv6UnknownOption,
 						pointer:            it.ParseOffset() + optsIt.OptionOffset(),
 						respondToMulticast: true,
-					}, pkt)
+					}, pkt, true /* specifyLocalAddr */)
 					return
 				default:
 					panic(fmt.Sprintf("unrecognized action for an unrecognized Hop By Hop extension header option = %d", opt))
@@ -833,7 +852,7 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 				_ = e.protocol.returnError(&icmpReasonParameterProblem{
 					code:    header.ICMPv6ErroneousHeader,
 					pointer: it.ParseOffset(),
-				}, pkt)
+				}, pkt, true /* specifyLocalAddr */)
 				return
 			}
 
@@ -923,7 +942,7 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 				_ = e.protocol.returnError(&icmpReasonParameterProblem{
 					code:    header.ICMPv6ErroneousHeader,
 					pointer: header.IPv6PayloadLenOffset,
-				}, pkt)
+				}, pkt, true /* specifyLocalAddr */)
 				return
 			}
 
@@ -944,7 +963,7 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 				_ = e.protocol.returnError(&icmpReasonParameterProblem{
 					code:    header.ICMPv6ErroneousHeader,
 					pointer: fragmentFieldOffset,
-				}, pkt)
+				}, pkt, true /* specifyLocalAddr */)
 				return
 			}
 
@@ -955,7 +974,7 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 				pkt := pkt.Clone()
 				releaseCB = func(timedOut bool) {
 					if timedOut {
-						_ = e.protocol.returnError(&icmpReasonReassemblyTimeout{}, pkt)
+						_ = e.protocol.returnError(&icmpReasonReassemblyTimeout{}, pkt, true /* specifyLocalAddr */)
 					}
 				}
 			}
@@ -1029,7 +1048,7 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 						code:               header.ICMPv6UnknownOption,
 						pointer:            it.ParseOffset() + optsIt.OptionOffset(),
 						respondToMulticast: true,
-					}, pkt)
+					}, pkt, true /* specifyLocalAddr */)
 					return
 				default:
 					panic(fmt.Sprintf("unrecognized action for an unrecognized Destination extension header option = %d", opt))
@@ -1062,7 +1081,7 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 					//   message with Code 4 in response to a packet for which the
 					//   transport protocol (e.g., UDP) has no listener, if that transport
 					//   protocol has no alternative means to inform the sender.
-					_ = e.protocol.returnError(&icmpReasonPortUnreachable{}, pkt)
+					_ = e.protocol.returnError(&icmpReasonPortUnreachable{}, pkt, true /* specifyLocalAddr */)
 				case stack.TransportPacketProtocolUnreachable:
 					// As per RFC 8200 section 4. (page 7):
 					//   Extension headers are numbered from IANA IP Protocol Numbers
@@ -1086,7 +1105,7 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 					_ = e.protocol.returnError(&icmpReasonParameterProblem{
 						code:    header.ICMPv6UnknownHeader,
 						pointer: it.ParseOffset(),
-					}, pkt)
+					}, pkt, true /* specifyLocalAddr */)
 				default:
 					panic(fmt.Sprintf("unrecognized result from DeliverTransportPacket = %d", res))
 				}
@@ -1096,7 +1115,7 @@ func (e *endpoint) handlePacket(pkt *stack.PacketBuffer) {
 			_ = e.protocol.returnError(&icmpReasonParameterProblem{
 				code:    header.ICMPv6UnknownHeader,
 				pointer: it.ParseOffset(),
-			}, pkt)
+			}, pkt, true /* specifyLocalAddr */)
 			stats.UnknownProtocolRcvdPackets.Increment()
 			return
 		}

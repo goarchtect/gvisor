@@ -116,7 +116,7 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer) {
 				errors.Is(err, errIPv4TimestampOptInvalidLength),
 				errors.Is(err, errIPv4TimestampOptInvalidPointer),
 				errors.Is(err, errIPv4TimestampOptOverflow):
-				_ = e.protocol.returnError(&icmpReasonParamProblem{pointer: aux}, pkt)
+				_ = e.protocol.returnError(&icmpReasonParamProblem{pointer: aux}, pkt, true /* specifyLocalAddr */)
 				stats.MalformedRcvdPackets.Increment()
 				stats.IP.MalformedPacketsReceived.Increment()
 			}
@@ -290,6 +290,13 @@ type icmpReasonProtoUnreachable struct{}
 
 func (*icmpReasonProtoUnreachable) isICMPReason() {}
 
+// icmpReasonTTLExceeded is an error where a packet's time to live exceeded in
+// transit to its final destination, as per RFC 792 page 6, Time Exceeded
+// Message.
+type icmpReasonTTLExceeded struct{}
+
+func (*icmpReasonTTLExceeded) isICMPReason() {}
+
 // icmpReasonReassemblyTimeout is an error where insufficient fragments are
 // received to complete reassembly of a packet within a configured time after
 // the reception of the first-arriving fragment of that packet.
@@ -310,7 +317,11 @@ func (*icmpReasonParamProblem) isICMPReason() {}
 // the problematic packet. It incorporates as much of that packet as
 // possible as well as any error metadata as is available. returnError
 // expects pkt to hold a valid IPv4 packet as per the wire format.
-func (p *protocol) returnError(reason icmpReason, pkt *stack.PacketBuffer) *tcpip.Error {
+//
+// If specifyLocalAddr is false, the packet's destination address will not be
+// used as the ICMP packet's source address. Instead, the stack will choose a
+// source address.
+func (p *protocol) returnError(reason icmpReason, pkt *stack.PacketBuffer, specifyLocalAddr bool) *tcpip.Error {
 	origIPHdr := header.IPv4(pkt.NetworkHeader().View())
 	origIPHdrSrc := origIPHdr.SourceAddress()
 	origIPHdrDst := origIPHdr.DestinationAddress()
@@ -346,7 +357,11 @@ func (p *protocol) returnError(reason icmpReason, pkt *stack.PacketBuffer) *tcpi
 	// a route to it - the remote may be blocked via routing rules. We must always
 	// consult our routing table and find a route to the remote before sending any
 	// packet.
-	route, err := p.stack.FindRoute(pkt.NICID, origIPHdrDst, origIPHdrSrc, ProtocolNumber, false /* multicastLoop */)
+	localAddr := origIPHdrDst
+	if !specifyLocalAddr {
+		localAddr = ""
+	}
+	route, err := p.stack.FindRoute(pkt.NICID, localAddr, origIPHdrSrc, ProtocolNumber, false /* multicastLoop */)
 	if err != nil {
 		return err
 	}
@@ -454,6 +469,10 @@ func (p *protocol) returnError(reason icmpReason, pkt *stack.PacketBuffer) *tcpi
 		icmpHdr.SetType(header.ICMPv4DstUnreachable)
 		icmpHdr.SetCode(header.ICMPv4ProtoUnreachable)
 		counter = sent.DstUnreachable
+	case *icmpReasonTTLExceeded:
+		icmpHdr.SetType(header.ICMPv4TimeExceeded)
+		icmpHdr.SetCode(header.ICMPv4TTLExceeded)
+		counter = sent.TimeExceeded
 	case *icmpReasonReassemblyTimeout:
 		icmpHdr.SetType(header.ICMPv4TimeExceeded)
 		icmpHdr.SetCode(header.ICMPv4ReassemblyTimeout)

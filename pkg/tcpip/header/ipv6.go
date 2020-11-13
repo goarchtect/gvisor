@@ -236,6 +236,11 @@ func (b IPv6) SetDestinationAddress(addr tcpip.Address) {
 	copy(b[v6DstAddr:][:IPv6AddressSize], addr)
 }
 
+// SetHopLimit sets the value of the "Hop Limit" field.
+func (b IPv6) SetHopLimit(v uint8) {
+	b[hopLimit] = v
+}
+
 // SetNextHeader sets the value of the "next header" field of the ipv6 header.
 func (b IPv6) SetNextHeader(v uint8) {
 	b[IPv6NextHeaderOffset] = v
