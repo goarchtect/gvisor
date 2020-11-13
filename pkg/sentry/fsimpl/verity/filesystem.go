@@ -158,15 +158,17 @@ afterSymlink:
 	return child, nil
 }
 
-// verifyChild verifies the hash of child against the already verified hash of
-// the parent to ensure the child is expected.  verifyChild triggers a sentry
-// panic if unexpected modifications to the file system are detected. In
+// verifyChildLocked verifies the hash of child against the already verified
+// hash of the parent to ensure the child is expected.  verifyChild triggers a
+// sentry panic if unexpected modifications to the file system are detected. In
 // noCrashOnVerificationFailure mode it returns a syserror instead.
+//
 // Preconditions: fs.renameMu must be locked. d.dirMu must be locked.
+//
 // TODO(b/166474175): Investigate all possible errors returned in this
 // function, and make sure we differentiate all errors that indicate unexpected
 // modifications to the file system from the ones that are not harmful.
-func (fs *filesystem) verifyChild(ctx context.Context, parent *dentry, child *dentry) (*dentry, error) {
+func (fs *filesystem) verifyChildLocked(ctx context.Context, parent *dentry, child *dentry) (*dentry, error) {
 	vfsObj := fs.vfsfs.VirtualFilesystem()
 
 	// Get the path to the child dentry. This is only used to provide path
@@ -470,7 +472,7 @@ func (fs *filesystem) getChildLocked(ctx context.Context, parent *dentry, name s
 		// be cached before enabled.
 		if fs.allowRuntimeEnable {
 			if parent.verityEnabled() {
-				if _, err := fs.verifyChild(ctx, parent, child); err != nil {
+				if _, err := fs.verifyChildLocked(ctx, parent, child); err != nil {
 					return nil, err
 				}
 			}
@@ -597,7 +599,7 @@ func (fs *filesystem) lookupAndVerifyLocked(ctx context.Context, parent *dentry,
 	// allowRuntimeEnable mode and the parent directory hasn't been enabled
 	// yet.
 	if parent.verityEnabled() {
-		if _, err := fs.verifyChild(ctx, parent, child); err != nil {
+		if _, err := fs.verifyChildLocked(ctx, parent, child); err != nil {
 			child.destroyLocked(ctx)
 			return nil, err
 		}

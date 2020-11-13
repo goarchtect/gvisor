@@ -718,13 +718,15 @@ func (fd *fileDescription) Seek(ctx context.Context, offset int64, whence int32)
 	return offset, nil
 }
 
-// generateMerkle generates a Merkle tree file for fd. If fd points to a file
-// /foo/bar, a Merkle tree file /foo/.merkle.verity.bar is generated. The hash
-// of the generated Merkle tree and the data size is returned.  If fd points to
-// a regular file, the data is the content of the file. If fd points to a
-// directory, the data is all hahes of its children, written to the Merkle tree
-// file.
-func (fd *fileDescription) generateMerkle(ctx context.Context) ([]byte, uint64, error) {
+// generateMerkleLocked generates a Merkle tree file for fd. If fd points to a
+// file /foo/bar, a Merkle tree file /foo/.merkle.verity.bar is generated. The
+// hash of the generated Merkle tree and the data size is returned.  If fd
+// points to a regular file, the data is the content of the file. If fd points
+// to a directory, the data is all hahes of its children, written to the Merkle
+// tree file.
+//
+// Preconditions: fd.d.fs.verityMu must be locked.
+func (fd *fileDescription) generateMerkleLocked(ctx context.Context) ([]byte, uint64, error) {
 	fdReader := vfs.FileReadWriteSeeker{
 		FD:  fd.lowerFD,
 		Ctx: ctx,
@@ -793,11 +795,12 @@ func (fd *fileDescription) generateMerkle(ctx context.Context) ([]byte, uint64, 
 	return hash, uint64(params.Size), err
 }
 
-// recordChildren writes the names of fd's children into the corresponding
-// Merkle tree file, and saves the offset/size of the map into xattrs.
+// recordChildrenLocked writes the names of fd's children into the
+// corresponding Merkle tree file, and saves the offset/size of the map into
+// xattrs.
 //
-// Preconditions: fd.d.isDir() == true
-func (fd *fileDescription) recordChildren(ctx context.Context) error {
+// Preconditions: fd.d.fs.verityMu must be locked and fd.d.isDir() == true
+func (fd *fileDescription) recordChildrenLocked(ctx context.Context) error {
 	// Record the children names in the Merkle tree file.
 	childrenNames, err := json.Marshal(fd.d.childrenNames)
 	if err != nil {
@@ -847,7 +850,7 @@ func (fd *fileDescription) enableVerity(ctx context.Context) (uintptr, error) {
 		return 0, alertIntegrityViolation("Unexpected verity fd: missing expected underlying fds")
 	}
 
-	hash, dataSize, err := fd.generateMerkle(ctx)
+	hash, dataSize, err := fd.generateMerkleLocked(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -888,7 +891,7 @@ func (fd *fileDescription) enableVerity(ctx context.Context) (uintptr, error) {
 	}
 
 	if fd.d.isDir() {
-		if err := fd.recordChildren(ctx); err != nil {
+		if err := fd.recordChildrenLocked(ctx); err != nil {
 			return 0, err
 		}
 	}
