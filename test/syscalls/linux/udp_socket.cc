@@ -374,6 +374,41 @@ TEST_P(UdpSocketTest, BindInUse) {
               SyscallFailsWithErrno(EADDRINUSE));
 }
 
+TEST_P(UdpSocketTest, ConnectWriteToInvalidPort) {
+  ASSERT_NO_ERRNO(BindLoopback());
+
+  // Send from sock_ to an unbound port.
+  char buf[512];
+  RandomizeBuffer(buf, sizeof(buf));
+  struct sockaddr_storage addr_storage = InetLoopbackAddr();
+  int port = 12345;
+  bool found_port = false;
+  for (; port < 65536; port++) {
+    PosixErrorOr<int> avail = gvisor::testing::PortAvailable(
+        port, GetParam(), gvisor::testing::SocketType::kUdp,
+        false /* reuse_addr */);
+    if (avail.ok()) {
+      found_port = true;
+      break;
+    }
+  }
+  ASSERT_THAT(found_port, true);
+  SetPort(&addr_storage, port);
+  struct sockaddr* addr = reinterpret_cast<struct sockaddr*>(&addr_storage);
+  ASSERT_THAT(connect(sock_.get(), addr, addrlen_), SyscallSucceeds());
+  ASSERT_THAT(sendto(sock_.get(), buf, sizeof(buf), 0, addr, addrlen_),
+              SyscallSucceedsWithValue(sizeof(buf)));
+
+  absl::SleepFor(absl::Milliseconds(200));
+  // Now verify that we got an ICMP error back of ECONNREFUSED.
+  int err;
+  socklen_t optlen = sizeof(err);
+  ASSERT_THAT(getsockopt(sock_.get(), SOL_SOCKET, SO_ERROR, &err, &optlen),
+              SyscallSucceeds());
+  ASSERT_EQ(err, ECONNREFUSED);
+  ASSERT_EQ(optlen, sizeof(err));
+}
+
 TEST_P(UdpSocketTest, ReceiveAfterConnect) {
   ASSERT_NO_ERRNO(BindLoopback());
   ASSERT_THAT(connect(sock_.get(), bind_addr_, addrlen_), SyscallSucceeds());
